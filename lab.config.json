@@ -1,0 +1,11 @@
+{
+	"pluginsDir": "..",
+	"pluginGlob": "craft-*",
+	"primaryPort": 8100,
+	"ephemeralPortBase": 8101,
+	"phpByCraftMajor": {
+		"4": "8.1",
+		"5": "8.2"
+	},
+	"nginxTag": "1.26"
+}

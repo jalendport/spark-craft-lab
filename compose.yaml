@@ -1,0 +1,55 @@
+name: spark-craft-lab
+
+services:
+  mysql:
+    image: jalendport/spark-mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    init: true
+    ports:
+      - "${LAB_MYSQL_PORT:-3308}:3306"
+    volumes:
+      - db-data:/var/lib/mysql
+    networks:
+      - lab
+
+  redis:
+    image: jalendport/spark-redis:7.2
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "root", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    init: true
+    networks:
+      - lab
+
+  mailpit:
+    image: axllent/mailpit:latest
+    environment:
+      MP_MAX_MESSAGES: 5000
+      MP_DATABASE: /data/mailpit.db
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    init: true
+    ports:
+      - "${LAB_MAILPIT_UI_PORT:-8126}:8025"
+    volumes:
+      - mailpit-data:/data
+    networks:
+      - lab
+
+networks:
+  lab:
+    name: spark-craft-lab
+
+volumes:
+  db-data:
+  mailpit-data:

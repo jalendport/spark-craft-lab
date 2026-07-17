@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""spark-craft-lab — mint and manage disposable Craft CMS instances for plugin testing.
+
+Usage:
+  lab up [name]               Start shared services + an instance (mints "primary" on first run)
+  lab down                    Stop every instance and the shared services
+  lab list                    Show instances and their state
+  lab destroy <name>          Tear down an instance and drop its database
+  lab reset [name]            Destroy and rebuild an instance from the skeleton
+  lab craft [name] <args...>  Run a Craft console command inside an instance
+  lab composer [name] <args>  Run Composer inside an instance
+  lab plugins                 Show discovered plugin working copies
+
+When [name] is omitted it defaults to "primary".
+"""
+
+import fnmatch
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.realpath(__file__))
+INSTANCES_DIR = os.path.join(ROOT, 'instances')
+SKELETON_DIR = os.path.join(ROOT, 'skeleton')
+COMPOSER_VOLUME = 'spark-craft-lab-composer'
+
+ADMIN_USERNAME = 'admin'
+ADMIN_PASSWORD = 'password'
+ADMIN_EMAIL = 'admin@lab.test'
+
+with open(os.path.join(ROOT, 'lab.config.json')) as f:
+    CONFIG = json.load(f)
+
+
+def fail(message):
+    print(f'lab: {message}', file=sys.stderr)
+    sys.exit(1)
+
+
+def sh(args, cwd=None, check=True, capture=False):
+    result = subprocess.run(
+        args,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.STDOUT if capture else None,
+    )
+    if check and result.returncode != 0:
+        if capture and result.stdout:
+            sys.stderr.write(result.stdout)
+        fail(f'command failed ({result.returncode}): {" ".join(args)}')
+    return result
+
+
+# ---------------------------------------------------------------- discovery
+
+def plugins_dir():
+    path = CONFIG['pluginsDir']
+    if not os.path.isabs(path):
+        path = os.path.join(ROOT, path)
+    return os.path.realpath(path)
+
+
+def latest_tag(repo):
+    result = subprocess.run(
+        ['git', '-C', repo, 'describe', '--tags', '--abbrev=0'],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip().lstrip('v') if result.returncode == 0 else None
+
+
+def discover():
+    """Find craft-* working copies next to the lab that composer can mount."""
+    packages = []
+    base = plugins_dir()
+    for entry in sorted(os.listdir(base)):
+        if not fnmatch.fnmatch(entry, CONFIG['pluginGlob']):
+            continue
+        composer_path = os.path.join(base, entry, 'composer.json')
+        if not os.path.isfile(composer_path):
+            continue
+        with open(composer_path) as f:
+            data = json.load(f)
+        if not data.get('name'):
+            continue
+        packages.append({
+            'dir': entry,
+            'name': data['name'],
+            'type': data.get('type', 'library'),
+            'handle': data.get('extra', {}).get('handle'),
+            'cms': data.get('require', {}).get('craftcms/cms', ''),
+            'version': latest_tag(os.path.join(base, entry)) or '0.1.0',
+        })
+    return packages
+
+
+def cms_matches(constraint, major):
+    return bool(re.search(rf'(^|[\^~>=|,\s]){major}\.', constraint))
+
+
+def installable(packages, major):
+    return [
+        p for p in packages
+        if p['type'] == 'craft-plugin' and p['handle'] and cms_matches(p['cms'], major)
+    ]
+
+
+# ---------------------------------------------------------------- instances
+
+def instance_dir(name):
+    return os.path.join(INSTANCES_DIR, name)
+
+
+def instance_exists(name):
+    return os.path.isfile(os.path.join(instance_dir(name), 'compose.yaml'))
+
+
+def instance_names():
+    if not os.path.isdir(INSTANCES_DIR):
+        return []
+    return sorted(n for n in os.listdir(INSTANCES_DIR) if instance_exists(n))
+
+
+def instance_meta(name):
+    with open(os.path.join(instance_dir(name), 'lab.instance.json')) as f:
+        return json.load(f)
+
+
+def db_name(name):
+    return 'lab_' + re.sub(r'[^a-z0-9_]', '_', name.lower())
+
+
+def compose_shared(*args, check=True, capture=False):
+    return sh(['docker', 'compose'] + list(args), cwd=ROOT, check=check, capture=capture)
+
+
+def compose_instance(name, *args, check=True, capture=False):
+    return sh(['docker', 'compose'] + list(args), cwd=instance_dir(name), check=check, capture=capture)
+
+
+def craft_exec(name, args, check=True, capture=False, tty=False):
+    exec_args = ['exec'] if tty else ['exec', '-T']
+    return compose_instance(name, *exec_args, 'php', 'php', 'craft', *args, check=check, capture=capture)
+
+
+# ---------------------------------------------------------------- minting
+
+def render_template(path, mapping):
+    with open(path) as f:
+        content = f.read()
+    for key, value in mapping.items():
+        content = content.replace(key, value)
+    with open(path.removesuffix('.tpl'), 'w') as f:
+        f.write(content)
+    os.remove(path)
+
+
+def mint(name, port, craft_major=5):
+    skeleton = os.path.join(SKELETON_DIR, f'craft-{craft_major}')
+    if not os.path.isdir(skeleton):
+        fail(f'no skeleton for Craft {craft_major}')
+    dest = instance_dir(name)
+    php_tag = CONFIG['phpByCraftMajor'][str(craft_major)]
+    packages = discover()
+    plugins = installable(packages, craft_major)
+
+    print(f'Minting "{name}" (Craft {craft_major}, PHP {php_tag}, port {port})')
+    os.makedirs(INSTANCES_DIR, exist_ok=True)
+    shutil.copytree(skeleton, dest)
+
+    mapping = {
+        '{{NAME}}': name,
+        '{{PORT}}': str(port),
+        '{{DB_NAME}}': db_name(name),
+        '{{APP_ID}}': f'spark-craft-lab--{name}',
+        '{{SECURITY_KEY}}': secrets.token_hex(32),
+        '{{PHP_TAG}}': php_tag,
+        '{{NGINX_TAG}}': CONFIG['nginxTag'],
+        '{{LAB_DIR}}': ROOT,
+        '{{PLUGINS_DIR}}': plugins_dir(),
+        '{{UID}}': str(os.getuid()),
+        '{{GID}}': str(os.getgid()),
+    }
+    for template in ('.env.tpl', 'compose.yaml.tpl'):
+        render_template(os.path.join(dest, template), mapping)
+
+    # Wire every local working copy in as a symlinked path repository; require
+    # only the plugins that match this instance's Craft major. The version
+    # override (latest git tag) lets inter-package constraints like
+    # "jalendport/craft-base": "^1.1.1" resolve against a branch checkout.
+    composer_path = os.path.join(dest, 'composer.json')
+    with open(composer_path) as f:
+        composer = json.load(f)
+    composer['repositories'] = [
+        {
+            'type': 'path',
+            'url': f'/plugins/{p["dir"]}',
+            'options': {'symlink': True, 'versions': {p['name']: p['version']}},
+        }
+        for p in packages
+    ]
+    for plugin in plugins:
+        composer['require'][plugin['name']] = '*'
+    composer['config']['platform']['php'] = php_tag
+    with open(composer_path, 'w') as f:
+        json.dump(composer, f, indent='\t')
+        f.write('\n')
+
+    meta = {
+        'name': name,
+        'port': port,
+        'craftMajor': craft_major,
+        'phpTag': php_tag,
+        'plugins': [{'name': p['name'], 'handle': p['handle']} for p in plugins],
+    }
+    with open(os.path.join(dest, 'lab.instance.json'), 'w') as f:
+        json.dump(meta, f, indent='\t')
+        f.write('\n')
+
+    for plugin in plugins:
+        print(f'  + {plugin["name"]} ({plugin["handle"]})')
+    return meta
+
+
+# ---------------------------------------------------------------- lifecycle
+
+def shared_up():
+    sh(['docker', 'volume', 'create', COMPOSER_VOLUME], capture=True)
+    compose_shared('up', '-d', '--wait')
+
+
+def ensure_db(name):
+    compose_shared(
+        'exec', '-T', 'mysql', 'mysql', '-uroot', '-proot', '-e',
+        f'CREATE DATABASE IF NOT EXISTS `{db_name(name)}`'
+        ' CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;',
+        capture=True,
+    )
+
+
+def drop_db(name):
+    compose_shared(
+        'exec', '-T', 'mysql', 'mysql', '-uroot', '-proot', '-e',
+        f'DROP DATABASE IF EXISTS `{db_name(name)}`;',
+        check=False, capture=True,
+    )
+
+
+def php_running(name):
+    result = compose_instance(name, 'ps', '--status', 'running', '-q', 'php', check=False, capture=True)
+    return bool(result.stdout.strip())
+
+
+def wait_for_vendor(name, timeout=900):
+    """The spark-php entrypoint runs `composer install` when vendor/ is missing;
+    wait for it to finish rather than racing it with our own install."""
+    autoload = os.path.join(instance_dir(name), 'vendor', 'autoload.php')
+    lock = os.path.join(instance_dir(name), 'composer.lock')
+    if os.path.isfile(autoload) and os.path.isfile(lock):
+        return
+    print('Waiting for composer install inside the php container', end='', flush=True)
+    started = time.time()
+    while not (os.path.isfile(autoload) and os.path.isfile(lock)):
+        if time.time() - started > timeout:
+            print()
+            fail(f'composer install timed out; check: docker compose logs php (in instances/{name})')
+        if not php_running(name):
+            print()
+            compose_instance(name, 'logs', '--tail', '40', 'php', check=False)
+            fail('php container stopped during composer install (see logs above)')
+        print('.', end='', flush=True)
+        time.sleep(3)
+    print(' done')
+
+
+def ensure_installed(name, meta):
+    ensure_db(name)
+    check = craft_exec(name, ['install/check'], check=False, capture=True)
+    if check.returncode != 0:
+        print('Installing Craft')
+        craft_exec(name, [
+            'install/craft', '--interactive=0',
+            f'--username={ADMIN_USERNAME}',
+            f'--password={ADMIN_PASSWORD}',
+            f'--email={ADMIN_EMAIL}',
+            f'--siteName=Spark Craft Lab ({name})',
+            f'--siteUrl=http://localhost:{meta["port"]}',
+            '--language=en-US',
+        ])
+    for plugin in meta['plugins']:
+        result = craft_exec(name, ['plugin/install', plugin['handle'], '--interactive=0'], check=False, capture=True)
+        if result.returncode == 0:
+            print(f'  plugin installed: {plugin["handle"]}')
+        elif 'already installed' in (result.stdout or ''):
+            pass
+        else:
+            print(f'  plugin FAILED: {plugin["handle"]}\n{result.stdout}', file=sys.stderr)
+
+
+def summarize(meta):
+    name = meta['name']
+    print()
+    print(f'{name} is up:')
+    print(f'  site:    http://localhost:{meta["port"]}')
+    print(f'  cp:      http://localhost:{meta["port"]}/admin  ({ADMIN_USERNAME} / {ADMIN_PASSWORD})')
+    print(f'  mailpit: http://localhost:{os.environ.get("LAB_MAILPIT_UI_PORT", "8126")}')
+    print(f'  craft:   ./lab craft {name} <command>')
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_up(argv):
+    name = argv[0] if argv else 'primary'
+    if name != 'primary' and not instance_exists(name):
+        fail(f'unknown instance "{name}" — ephemeral instances arrive with `lab spin` (phase 2)')
+    shared_up()
+    if not instance_exists(name):
+        mint(name, CONFIG['primaryPort'])
+    meta = instance_meta(name)
+    compose_instance(name, 'up', '-d', '--build', '--wait')
+    wait_for_vendor(name)
+    ensure_installed(name, meta)
+    summarize(meta)
+
+
+def cmd_down(argv):
+    for name in instance_names():
+        compose_instance(name, 'stop', check=False)
+    compose_shared('stop', check=False)
+
+
+def cmd_list(argv):
+    names = instance_names()
+    if not names:
+        print('no instances — run: ./lab up')
+        return
+    for name in names:
+        meta = instance_meta(name)
+        state = 'running' if php_running(name) else 'stopped'
+        print(f'{name:<14} http://localhost:{meta["port"]}  craft-{meta["craftMajor"]}  php {meta["phpTag"]}  {state}')
+
+
+def cmd_destroy(argv):
+    if not argv:
+        fail('usage: lab destroy <name>')
+    name = argv[0]
+    if not instance_exists(name):
+        fail(f'no such instance: {name}')
+    compose_instance(name, 'down', '-v', '--remove-orphans', check=False)
+    drop_db(name)
+    shutil.rmtree(instance_dir(name), ignore_errors=True)
+    print(f'destroyed {name}')
+
+
+def cmd_reset(argv):
+    name = argv[0] if argv else 'primary'
+    if instance_exists(name):
+        cmd_destroy([name])
+    cmd_up([name])
+
+
+def resolve_name(argv):
+    if argv and argv[0] in instance_names():
+        return argv[0], argv[1:]
+    return 'primary', argv
+
+
+def cmd_craft(argv):
+    name, rest = resolve_name(argv)
+    if not instance_exists(name):
+        fail(f'no such instance: {name}')
+    result = craft_exec(name, rest, check=False, tty=sys.stdout.isatty())
+    sys.exit(result.returncode)
+
+
+def cmd_composer(argv):
+    name, rest = resolve_name(argv)
+    if not instance_exists(name):
+        fail(f'no such instance: {name}')
+    result = compose_instance(name, 'exec', 'php', 'composer', *rest, check=False)
+    sys.exit(result.returncode)
+
+
+def cmd_plugins(argv):
+    packages = discover()
+    if not packages:
+        print(f'no craft-* packages found in {plugins_dir()}')
+        return
+    primary = {p['name'] for p in installable(packages, 5)}
+    for p in packages:
+        marker = '*' if p['name'] in primary else ' '
+        handle = p['handle'] or '-'
+        print(f'{marker} {p["dir"]:<18} {p["type"]:<13} handle={handle:<15} cms={p["cms"] or "-":<10} v{p["version"]}')
+    print('\n* installed on the primary instance (craft-plugin matching Craft 5)')
+
+
+COMMANDS = {
+    'up': cmd_up,
+    'down': cmd_down,
+    'list': cmd_list,
+    'destroy': cmd_destroy,
+    'reset': cmd_reset,
+    'craft': cmd_craft,
+    'composer': cmd_composer,
+    'plugins': cmd_plugins,
+}
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ('-h', '--help', 'help'):
+        print(__doc__.strip())
+        return
+    command = COMMANDS.get(argv[0])
+    if not command:
+        fail(f'unknown command "{argv[0]}" — run `lab help`')
+    command(argv[1:])
+
+
+if __name__ == '__main__':
+    main()

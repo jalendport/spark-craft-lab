@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<title>Spark Craft Lab</title>
+</head>
+<body>
+	<h1>Spark Craft Lab</h1>
+	<ul>
+		<li>Craft {{ craft.app.version }}</li>
+		<li>PHP {{ constant('PHP_VERSION') }}</li>
+		<li>Database: {{ craft.app.db.driverName }}</li>
+	</ul>
+
+	<h2>Installed plugins</h2>
+	<ul>
+		{% for plugin in craft.app.plugins.allPlugins %}
+			<li>{{ plugin.name }} {{ plugin.version }}</li>
+		{% else %}
+			<li>none</li>
+		{% endfor %}
+	</ul>
+</body>
+</html>
