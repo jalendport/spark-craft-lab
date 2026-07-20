@@ -1,0 +1,14 @@
+{% set body = entry.labBody ?? '' %}
+
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<title>{{ entry.title }}</title>
+	</head>
+	<body>
+		<h1>{{ entry.title }}</h1>
+		<p>{{ entry.labSummary ?? '' }}</p>
+		{{ body|nl2br }}
+	</body>
+</html>
