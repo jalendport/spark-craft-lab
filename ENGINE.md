@@ -6,12 +6,13 @@ This document is the interface between the two. If you change the assets, keep t
 
 ## 1. What the engine expects of this repo
 
-Two directories, validated on every fetch:
+Two directories and a contract marker, validated on every fetch:
 
-| Directory | Contents |
+| Path | Contents |
 | --- | --- |
 | `skeleton/craft-4/`, `skeleton/craft-5/` | Minimal Craft project templates: `composer.json`, `.env.tpl`, `compose.yaml.tpl`, `config/craft/`, `craft`, `web/`, `storage/`, `templates/` (the generic site templates `index.twig` + `_lab/article.twig`, served from `/app/templates`), and `modules/lab/` — the per-major in-Craft `lab` module (§9), already registered in the skeleton's `composer.json` and `config/craft/app.php` |
 | `docker/` | The php image build context (adds `pdo_pgsql` and a host-UID `spark` user to `spark-php`), copied into each instance as `.docker/` |
+| `.spark-engine-contract` | The machine-readable revision of this contract (currently `1`). The engine refuses a bundle whose declared revision differs from the one it speaks, so a breaking asset change surfaces as "upgrade spark / pull the assets" instead of a failure deep inside mint. Bump it only when a change here requires a matching engine change. |
 
 There is **no persistent cache**: `spark lab up` shallow-clones this repo into a temp dir, copies what the instance needs, and discards the clone. Every other command works from the instance's own copies and never touches the network. Setting `SPARK_LAB_ASSETS` to a local checkout skips the clone — that's how you develop these assets.
 
